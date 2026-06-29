@@ -37,7 +37,8 @@ async function upsertTransactions(txns) {
   const rows = txns.map(t => ({
     id: t.id, date: t.date ? t.date.toISOString().split("T")[0] : null,
     description: t.description, amount: t.amount, currency: t.currency || "EUR",
-    category: t.category, source: t.source, file_name: t.file_name || null
+    category: t.category, source: t.source, file_name: t.file_name || null,
+    spender: t.spender || "Matteo"
   }));
   for (let i = 0; i < rows.length; i += 500) {
     await sbFetch("transactions", {
@@ -51,10 +52,22 @@ async function updateCategoryInDB(id, category) {
     method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ category })
   });
 }
+async function updateSpenderInDB(id, spender) {
+  await sbFetch(`transactions?id=eq.${encodeURIComponent(id)}`, {
+    method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ spender })
+  });
+}
+async function deleteTransactionInDB(id) {
+  await sbFetch(`transactions?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE", prefer: "return=minimal"
+  });
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const IT_MONTHS = { "gen":0,"feb":1,"mar":2,"apr":3,"mag":4,"giu":5,"lug":6,"ago":7,"set":8,"ott":9,"nov":10,"dic":11 };
+const SPENDERS = ["Matteo","Helena"];
+const SPENDER_COLORS = { "Matteo":"#818cf8", "Helena":"#f472b6" };
 
 const CATEGORIES = [
   "🍽️ Food & Dining","🛒 Groceries","🚗 Transport","🏠 Housing","💊 Health",
@@ -109,8 +122,6 @@ function splitCSVLine(line) {
   result.push(cur.trim());
   return result;
 }
-
-// Parse Italian date: "2 gen 2026" → Date
 function parseItalianDate(raw) {
   if (!raw) return null;
   const clean = raw.replace(/^"|"$/g,"").trim();
@@ -120,199 +131,105 @@ function parseItalianDate(raw) {
   if (month === undefined) return null;
   return new Date(+m[3], month, +m[1]);
 }
-
-// Parse standard ISO / DD/MM/YYYY date
 function parseStdDate(raw) {
   if (!raw) return null;
   const clean = raw.replace(/^"|"$/g,"").trim();
-  // ISO: 2026-01-09
   if (/^\d{4}-\d{2}-\d{2}/.test(clean)) return new Date(clean.slice(0,10));
-  // DD/MM/YYYY
   const m = clean.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (m) return new Date(+m[3], +m[2]-1, +m[1]);
   return null;
 }
-
-// Parse European-formatted number: "1.206,74€" or "-1.075,58 AED (-250,78€)" → number + currency
-// We always prefer the EUR equivalent in parentheses when present
 function parseEuropeanAmount(raw) {
   if (!raw) return { amount: null, currency: "EUR" };
   const clean = raw.replace(/^"|"$/g,"").trim();
-
-  // Try to find EUR amount in parentheses: (-250,78€) or (585,44€)
   const eurInParen = clean.match(/\(([+-]?[\d.,]+)€\)/);
   if (eurInParen) {
     const num = parseFloat(eurInParen[1].replace(/\./g,"").replace(",","."));
     return { amount: isNaN(num) ? null : num, currency: "EUR" };
   }
-
-  // Pure EUR amount: "1.206,74€" or "-844,30€"
   const eurDirect = clean.match(/^([+-]?[\d.,]+)€$/);
   if (eurDirect) {
     const num = parseFloat(eurDirect[1].replace(/\./g,"").replace(",","."));
     return { amount: isNaN(num) ? null : num, currency: "EUR" };
   }
-
-  // AED amount without parens: "-1.743,00" with no currency marker — treat as native
   const plain = clean.match(/^([+-]?[\d.,]+)$/);
   if (plain) {
     const num = parseFloat(plain[1].replace(/\./g,"").replace(",","."));
     return { amount: isNaN(num) ? null : num, currency: null };
   }
-
   return { amount: null, currency: "EUR" };
 }
 
-// ─── REVOLUT PARSER (Italian consolidated statement) ─────────────────────────
-// Structure: metadata header blocks, then "Estratti conto delle operazioni" section,
-// then per-currency sub-sections each starting with "Conto personale (XYZ)" and
-// a transaction table header: Data,Descrizione,Categoria,"Denaro in entrata/uscita",...
+// ─── Parsers ──────────────────────────────────────────────────────────────────
 function parseRevolutIT(text) {
   const lines = text.split("\n");
-
-  // Must contain the Italian transaction section marker
   if (!text.includes("Estratti conto delle operazioni") && !text.includes("Riepilogo delle transazioni")) return null;
-
   const rows = [];
   let currentCurrency = "EUR";
   let inTransactionTable = false;
-
   for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const cols = splitCSVLine(raw);
+    const cols = splitCSVLine(lines[i]);
     const first = (cols[0] || "").replace(/^"|"$/g,"").trim();
-
-    // Detect currency section: "Conto personale (EUR)" etc.
     const currMatch = first.match(/^Conto personale \(([A-Z]+)\)$/);
-    if (currMatch) {
-      currentCurrency = currMatch[1];
-      inTransactionTable = false;
-      continue;
-    }
-
-    // Detect transaction table header
-    if (first === "Data" && cols[1] && cols[1].replace(/^"|"$/g,"").trim() === "Descrizione") {
-      inTransactionTable = true;
-      continue;
-    }
-
-    // End of transaction table
-    if (first === "Totale" || first === "---------" || first === "") {
-      if (first === "Totale" || first === "---------") inTransactionTable = false;
-      continue;
-    }
-
+    if (currMatch) { currentCurrency = currMatch[1]; inTransactionTable = false; continue; }
+    if (first === "Data" && cols[1] && cols[1].replace(/^"|"$/g,"").trim() === "Descrizione") { inTransactionTable = true; continue; }
+    if (first === "Totale" || first === "---------" || first === "") { if (first !== "") inTransactionTable = false; continue; }
     if (!inTransactionTable) continue;
-
-    // Transaction row: Date, Description, Category, Amount, Balance, ...
     const dateRaw = cols[0] || "";
     const description = (cols[1] || "").replace(/^"|"$/g,"").trim();
     const amountRaw = cols[3] || "";
-
     const date = parseItalianDate(dateRaw);
-    if (!date) continue;
-    if (!description) continue;
-
+    if (!date || !description) continue;
     const { amount, currency } = parseEuropeanAmount(amountRaw);
     if (amount === null) continue;
-
-    // Skip credits (positive) and currency conversions and investment transfers
     const cat3 = (cols[2] || "").replace(/^"|"$/g,"").trim().toLowerCase();
-    if (cat3 === "cambio valuta") continue; // skip FX conversions
-    if (amount >= 0) continue; // skip credits
-
+    if (cat3 === "cambio valuta") continue;
+    if (amount >= 0) continue;
     const finalAmount = currency === "EUR" ? Math.abs(amount) : Math.abs(toEUR(amount, currentCurrency));
-
-    rows.push({
-      date,
-      description,
-      amount: +finalAmount.toFixed(2),
-      currency: "EUR",
-      source: "Revolut"
-    });
+    rows.push({ date, description, amount: +finalAmount.toFixed(2), currency: "EUR", source: "Revolut" });
   }
-
   return rows.length ? rows : null;
 }
 
-// ─── WIO PARSER ───────────────────────────────────────────────────────────────
-// Columns: Account name, Account type, Account IBAN, Account number, Card number,
-//          Account currency, Transaction type, Date, Ref. number, Description, Amount, Balance, ...
-// Debits have negative Amount. Filter out: Interest credits, Cashback, Salary,
-// Savings transfers in/out (Fixed Saving Space rows), Transfers in (positive)
 function parseWio(text) {
   const lines = text.split("\n");
   const header = (lines[0] || "").toLowerCase();
-
-  // Detect Wio by its column structure
   if (!header.includes("account name") && !header.includes("transaction type")) return null;
-
-  // Find column indices from header
   const headerCols = splitCSVLine(lines[0]);
   const idx = {};
-  headerCols.forEach((h, i) => {
-    const k = h.replace(/^"|"$/g,"").trim().toLowerCase();
-    idx[k] = i;
-  });
-
+  headerCols.forEach((h, i) => { idx[h.replace(/^"|"$/g,"").trim().toLowerCase()] = i; });
   const dateIdx = idx["date"] ?? 7;
   const descIdx = idx["description"] ?? 9;
   const amtIdx  = idx["amount"] ?? 10;
   const typeIdx = idx["transaction type"] ?? 6;
   const currIdx = idx["account currency"] ?? 5;
   const acctTypeIdx = idx["account type"] ?? 1;
-
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
     const cols = splitCSVLine(lines[i]);
     if (cols.length < 5) continue;
-
     const acctType = (cols[acctTypeIdx] || "").replace(/^"|"$/g,"").trim().toLowerCase();
-    // Skip Fixed Saving Space rows entirely — they are savings movements, not expenses
     if (acctType.includes("saving")) continue;
-
     const txType = (cols[typeIdx] || "").replace(/^"|"$/g,"").trim().toLowerCase();
     const description = (cols[descIdx] || "").replace(/^"|"$/g,"").trim();
     const amountRaw = (cols[amtIdx] || "").replace(/^"|"$/g,"").trim();
     const currency = (cols[currIdx] || "AED").replace(/^"|"$/g,"").trim();
     const dateRaw = (cols[dateIdx] || "").replace(/^"|"$/g,"").trim();
-
     const date = parseStdDate(dateRaw);
     if (!date) continue;
-
     const amount = parseFloat(amountRaw);
-    if (isNaN(amount)) continue;
-
-    // Skip income/credits: positive amounts that are interest, cashback, salary, savings returns
-    if (amount > 0) continue;
-
-    // Skip internal savings transfers (large round-number transfers to self)
+    if (isNaN(amount) || amount > 0) continue;
     if (txType === "transfers") {
       const descL = description.toLowerCase();
-      // Skip salary credits (already filtered by amount > 0, but belt-and-braces)
       if (descL.includes("salary") || descL.includes("etisalat grp")) continue;
-      // Skip fixed saving space movements
       if (descL.includes("fixed saving") || descL.includes("saving space")) continue;
     }
-
-    const finalAmount = +toEUR(Math.abs(amount), currency).toFixed(2);
-
-    rows.push({
-      date,
-      description,
-      amount: finalAmount,
-      currency: "EUR",
-      source: "Wio"
-    });
+    rows.push({ date, description, amount: +toEUR(Math.abs(amount), currency).toFixed(2), currency: "EUR", source: "Wio" });
   }
-
   return rows.length ? rows : null;
 }
 
-// ─── Main parse dispatcher ────────────────────────────────────────────────────
-function parseCSV(text) {
-  return parseRevolutIT(text) || parseWio(text);
-}
+function parseCSV(text) { return parseRevolutIT(text) || parseWio(text); }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function ExpenseTracker() {
@@ -323,9 +240,11 @@ export default function ExpenseTracker() {
   const [importing, setImporting] = useState(false);
   const [importMsg, setImportMsg] = useState(null);
   const [view, setView] = useState("dashboard");
-  const [editingTx, setEditingTx] = useState(null);
-  const [filterMonth, setFilterMonth] = useState(null);
+  const [editingTx, setEditingTx] = useState(null);  // for category modal
+  const [confirmDelete, setConfirmDelete] = useState(null); // tx to confirm delete
+  const [filterMonth, setFilterMonth] = useState(null); // null = all months
   const [filterCat, setFilterCat] = useState(null);
+  const [filterSpender, setFilterSpender] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const fileRef = useRef();
@@ -342,7 +261,7 @@ export default function ExpenseTracker() {
   const ingestFile = useCallback(async (file) => {
     const fileName = file.name;
     if (importedFiles.includes(fileName)) {
-      setImportMsg({ type:"warn", text:`"${fileName}" already imported — skipping to avoid duplicates.` });
+      setImportMsg({ type:"warn", text:`"${fileName}" already imported — skipping duplicates.` });
       setTimeout(()=>setImportMsg(null), 4000); return;
     }
     setImporting(true);
@@ -350,8 +269,7 @@ export default function ExpenseTracker() {
     const reader = new FileReader();
     reader.onload = async (e) => {
       try {
-        const text = e.target.result;
-        const rows = parseCSV(text);
+        const rows = parseCSV(e.target.result);
         if (!rows || rows.length === 0) {
           setImportMsg({ type:"error", text:"Could not parse file — check it's a Revolut or Wio CSV export." });
           setImporting(false); setTimeout(()=>setImportMsg(null), 6000); return;
@@ -360,7 +278,7 @@ export default function ExpenseTracker() {
           id: `${fileName}-${i}-${r.date?.toISOString()}-${r.amount}-${r.description?.slice(0,10)}`,
           date: r.date, description: r.description, amount: r.amount,
           currency: "EUR", category: autoCategory(r.description),
-          source: r.source, file_name: fileName
+          source: r.source, file_name: fileName, spender: "Matteo"
         }));
         setImportMsg({ type:"info", text:`Saving ${newTxns.length} transactions…` });
         await upsertTransactions(newTxns);
@@ -388,14 +306,31 @@ export default function ExpenseTracker() {
     try { await updateCategoryInDB(id, cat); } catch(e) { console.error(e); }
   };
 
+  const updateSpender = async (id, spender) => {
+    setTransactions(prev => prev.map(t => t.id===id ? {...t,spender} : t));
+    try { await updateSpenderInDB(id, spender); } catch(e) { console.error(e); }
+  };
+
+  const deleteTransaction = async (tx) => {
+    setTransactions(prev => prev.filter(t => t.id !== tx.id));
+    setConfirmDelete(null);
+    try { await deleteTransactionInDB(tx.id); } catch(e) { console.error(e); }
+  };
+
+  // ── Derived data
   const allMonths = useMemo(() => {
     const set = new Set(transactions.map(t => t.date ? `${t.date.getFullYear()}-${t.date.getMonth()}` : null).filter(Boolean));
     return [...set].sort();
   }, [transactions]);
 
+  // monthlyByCategory: respects spender filter
+  const filteredForStats = useMemo(() =>
+    filterSpender ? transactions.filter(t => t.spender === filterSpender) : transactions
+  , [transactions, filterSpender]);
+
   const monthlyByCategory = useMemo(() => {
     const map = {};
-    for (const t of transactions) {
+    for (const t of filteredForStats) {
       if (!t.date) continue;
       const mk = `${t.date.getFullYear()}-${t.date.getMonth()}`;
       const cat = t.category || "❓ Other";
@@ -403,30 +338,58 @@ export default function ExpenseTracker() {
       map[mk][cat] = (map[mk][cat] || 0) + t.amount;
     }
     return map;
-  }, [transactions]);
+  }, [filteredForStats]);
 
+  // Dashboard: "all months" mode shows averages
+  const isAllMonths = filterMonth === "ALL";
+  const summaryMonthKey = !filterMonth
+    ? (()=>{ const now = new Date(); const k=`${now.getFullYear()}-${now.getMonth()}`; return allMonths.includes(k)?k:allMonths[allMonths.length-1]||k; })()
+    : filterMonth;
+
+  const monthTotals = useMemo(() => {
+    if (isAllMonths) {
+      // Average across all months
+      const totals = {};
+      const n = allMonths.length || 1;
+      for (const mk of allMonths) {
+        for (const [cat, amt] of Object.entries(monthlyByCategory[mk]||{})) {
+          totals[cat] = (totals[cat]||0) + amt;
+        }
+      }
+      for (const cat of Object.keys(totals)) totals[cat] = +(totals[cat]/n).toFixed(2);
+      return totals;
+    }
+    return monthlyByCategory[summaryMonthKey] || {};
+  }, [isAllMonths, summaryMonthKey, monthlyByCategory, allMonths]);
+
+  const totalSpend = Object.values(monthTotals).reduce((a,b)=>a+b,0);
+
+  // Trend data includes a "Total" series
   const trendData = useMemo(() => allMonths.map(mk => {
     const [y,m] = mk.split("-");
     const row = { month:`${MONTHS[+m]} ${y}` };
-    for (const cat of CATEGORIES) row[cat] = +(monthlyByCategory[mk]?.[cat]||0).toFixed(2);
+    let total = 0;
+    for (const cat of CATEGORIES) {
+      const v = +(monthlyByCategory[mk]?.[cat]||0).toFixed(2);
+      row[cat] = v;
+      total += v;
+    }
+    row["📊 Total"] = +total.toFixed(2);
     return row;
   }), [allMonths, monthlyByCategory]);
 
-  const now = new Date();
-  const currentMonthKey = `${now.getFullYear()}-${now.getMonth()}`;
-  const summaryMonth = filterMonth || (allMonths.includes(currentMonthKey) ? currentMonthKey : allMonths[allMonths.length-1] || currentMonthKey);
-  const monthTotals = monthlyByCategory[summaryMonth] || {};
-  const totalSpend = Object.values(monthTotals).reduce((a,b)=>a+b,0);
+  const activeCategories = useMemo(() => CATEGORIES.filter(c => trendData.some(r=>r[c]>0)), [trendData]);
 
+  // Transactions list filters
   const visibleTransactions = useMemo(() => transactions.filter(t => {
     if (!t.date) return false;
     const mk = `${t.date.getFullYear()}-${t.date.getMonth()}`;
-    if (filterMonth && mk !== filterMonth) return false;
+    if (filterMonth && !isAllMonths && mk !== filterMonth) return false;
     if (filterCat && t.category !== filterCat) return false;
+    if (filterSpender && t.spender !== filterSpender) return false;
     return true;
-  }).sort((a,b)=>b.date-a.date), [transactions, filterMonth, filterCat]);
+  }).sort((a,b)=>b.date-a.date), [transactions, filterMonth, isAllMonths, filterCat, filterSpender]);
 
-  const activeCategories = useMemo(() => CATEGORIES.filter(c => trendData.some(r=>r[c]>0)), [trendData]);
   const msgColors = { ok:"#10b981", error:"#ef4444", warn:"#f59e0b", info:"#3b82f6" };
 
   return (
@@ -445,11 +408,13 @@ export default function ExpenseTracker() {
         .drop-zone{border:2px dashed #374151;border-radius:12px;text-align:center;transition:all 0.2s;cursor:pointer}
         .drop-zone.over{border-color:#f59e0b;background:rgba(245,158,11,0.05)}
         .tx-row{border-bottom:1px solid #1f2937;padding:12px 0;display:flex;align-items:center;gap:12px;transition:background 0.1s}
-        .tx-row:hover{background:#111827;border-radius:8px;padding-left:8px;padding-right:8px}
+        .tx-row:hover{background:#0f172a;border-radius:8px;padding-left:8px;padding-right:8px}
         .btn{padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-family:inherit;font-size:11px;letter-spacing:0.1em;text-transform:uppercase}
         .btn-gold{background:#f59e0b;color:#000;font-weight:500}
         .btn-ghost{background:#1f2937;color:#94a3b8}
         .btn-ghost:hover{background:#374151}
+        .btn-danger{background:#7f1d1d;color:#fca5a5}
+        .btn-danger:hover{background:#991b1b}
         .btn:disabled{opacity:0.5;cursor:not-allowed}
         select{background:#1f2937;border:1px solid #374151;color:#e2e8f0;padding:6px 10px;border-radius:6px;font-family:inherit;font-size:12px;outline:none}
         .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:100;display:flex;align-items:center;justify-content:center}
@@ -457,11 +422,16 @@ export default function ExpenseTracker() {
         .source-badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:500}
         .src-revolut{background:#191970;color:#818cf8}
         .src-wio{background:#0d2b1f;color:#34d399}
+        .spender-btn{font-size:10px;padding:2px 10px;border-radius:20px;border:none;cursor:pointer;font-family:inherit;font-weight:500;transition:all 0.15s}
         .progress-bar{height:4px;border-radius:2px;background:#1f2937;overflow:hidden;margin-top:6px}
         .progress-fill{height:100%;border-radius:2px;transition:width 0.6s ease}
         .number-big{font-family:'Syne',sans-serif;font-size:28px;font-weight:800}
         .pulse{animation:pulse 1.5s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
         .db-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
+        .delete-btn{opacity:0;transition:opacity 0.15s;background:none;border:none;cursor:pointer;color:#ef4444;font-size:16px;padding:2px 6px}
+        .tx-row:hover .delete-btn{opacity:1}
+        .filter-chip{padding:4px 12px;border-radius:20px;border:1px solid #374151;background:none;color:#64748b;font-family:inherit;font-size:11px;cursor:pointer;transition:all 0.15s}
+        .filter-chip.active{border-color:#f59e0b;color:#f59e0b;background:rgba(245,158,11,0.08)}
       `}</style>
 
       {/* Header */}
@@ -513,15 +483,13 @@ export default function ExpenseTracker() {
             <div style={{fontSize:12,color:"#64748b",marginBottom:10,letterSpacing:"0.1em",textTransform:"uppercase"}}>Imported Files</div>
             {importedFiles.map(f=>(
               <div key={f} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #1f2937",fontSize:12}}>
-                <span style={{color:"#10b981"}}>✓</span>
-                <span style={{flex:1}}>{f}</span>
+                <span style={{color:"#10b981"}}>✓</span><span style={{flex:1}}>{f}</span>
                 <span style={{fontSize:10,color:"#4b5563"}}>already in DB</span>
               </div>
             ))}
           </div>
         )}
 
-        {/* Drop zone */}
         <div className={`drop-zone ${dragOver?"over":""}`}
           style={{marginBottom:28,display:"flex",alignItems:"center",justifyContent:"center",gap:16,padding:"20px 40px"}}
           onDragOver={e=>{e.preventDefault();setDragOver(true)}}
@@ -533,12 +501,7 @@ export default function ExpenseTracker() {
           </div>
         </div>
 
-        {dbStatus==="loading" && (
-          <div style={{textAlign:"center",padding:"60px 0",color:"#4b5563",fontSize:13}}>
-            <div className="pulse">Connecting to database…</div>
-          </div>
-        )}
-
+        {dbStatus==="loading" && <div style={{textAlign:"center",padding:"60px 0",color:"#4b5563",fontSize:13}}><div className="pulse">Connecting to database…</div></div>}
         {dbStatus==="ok" && transactions.length===0 && (
           <div style={{textAlign:"center",padding:"60px 0",color:"#4b5563"}}>
             <div style={{fontSize:40,marginBottom:12}}>📊</div>
@@ -547,19 +510,30 @@ export default function ExpenseTracker() {
           </div>
         )}
 
-        {/* DASHBOARD */}
+        {/* ── DASHBOARD ── */}
         {view==="dashboard" && dbStatus==="ok" && transactions.length>0 && (
           <div>
-            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:24}}>
+            {/* Controls row */}
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20,flexWrap:"wrap"}}>
               <span style={{fontSize:11,color:"#64748b",letterSpacing:"0.1em",textTransform:"uppercase"}}>Month</span>
-              <select value={summaryMonth} onChange={e=>setFilterMonth(e.target.value)}>
+              <select value={filterMonth||summaryMonthKey} onChange={e=>setFilterMonth(e.target.value==="ALL"?"ALL":e.target.value)}>
+                <option value="ALL">All months (avg)</option>
                 {allMonths.map(mk=>{const[y,m]=mk.split("-");return<option key={mk} value={mk}>{MONTHS[+m]} {y}</option>;})}
               </select>
-              <span style={{marginLeft:"auto",fontSize:12,color:"#64748b"}}>{transactions.length} transactions in database</span>
+              <span style={{fontSize:11,color:"#64748b",letterSpacing:"0.1em",textTransform:"uppercase",marginLeft:8}}>Spender</span>
+              <select value={filterSpender||""} onChange={e=>setFilterSpender(e.target.value||null)}>
+                <option value="">All</option>
+                {SPENDERS.map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+              <span style={{marginLeft:"auto",fontSize:12,color:"#64748b"}}>{transactions.length} transactions</span>
             </div>
+
+            {/* Total card */}
             <div className="card" style={{padding:"20px 24px",marginBottom:20,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
               <div>
-                <div style={{fontSize:11,color:"#64748b",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:6}}>Total Spend</div>
+                <div style={{fontSize:11,color:"#64748b",letterSpacing:"0.12em",textTransform:"uppercase",marginBottom:6}}>
+                  {isAllMonths ? `Monthly Average · ${allMonths.length} months` : "Total Spend"}
+                </div>
                 <div className="number-big">€{totalSpend.toLocaleString("en",{maximumFractionDigits:0})}</div>
               </div>
               <div style={{display:"flex",gap:8}}>
@@ -567,6 +541,8 @@ export default function ExpenseTracker() {
                 <div className="source-badge src-wio">Wio</div>
               </div>
             </div>
+
+            {/* Category cards */}
             <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:12}}>
               {CATEGORIES.filter(c=>monthTotals[c]>0).sort((a,b)=>monthTotals[b]-monthTotals[a]).map(cat=>{
                 const amt=monthTotals[cat]||0;
@@ -580,7 +556,7 @@ export default function ExpenseTracker() {
                       <span style={{fontSize:14,fontWeight:500,color:col}}>€{amt.toLocaleString("en",{maximumFractionDigits:0})}</span>
                     </div>
                     <div className="progress-bar"><div className="progress-fill" style={{width:`${pct}%`,background:col}}/></div>
-                    <div style={{fontSize:10,color:"#4b5563",marginTop:4}}>{pct.toFixed(1)}% of total</div>
+                    <div style={{fontSize:10,color:"#4b5563",marginTop:4}}>{pct.toFixed(1)}% of total{isAllMonths?" (avg)":""}</div>
                   </div>
                 );
               })}
@@ -588,13 +564,42 @@ export default function ExpenseTracker() {
           </div>
         )}
 
-        {/* TRENDS */}
+        {/* ── TRENDS ── */}
         {view==="trends" && dbStatus==="ok" && transactions.length>0 && (
           <div>
-            <div style={{marginBottom:24}}>
-              <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,marginBottom:4}}>Spending Trends</div>
-              <div style={{fontSize:12,color:"#64748b"}}>Monthly evolution per category · EUR</div>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
+              <div>
+                <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800,marginBottom:4}}>Spending Trends</div>
+                <div style={{fontSize:12,color:"#64748b"}}>Monthly evolution · EUR</div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.1em"}}>Spender</span>
+                <select value={filterSpender||""} onChange={e=>setFilterSpender(e.target.value||null)}>
+                  <option value="">All</option>
+                  {SPENDERS.map(s=><option key={s} value={s}>{s}</option>)}
+                </select>
+              </div>
             </div>
+
+            {/* Total trend — always first and prominent */}
+            <div className="card" style={{padding:"20px 24px",marginBottom:24,border:"1px solid #374151"}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                <span style={{fontSize:15,fontWeight:500}}>📊 Total Spending</span>
+                <span style={{fontSize:12,color:"#64748b"}}>avg €{(trendData.reduce((s,r)=>s+r["📊 Total"],0)/Math.max(trendData.length,1)).toFixed(0)}/mo</span>
+              </div>
+              <ResponsiveContainer width="100%" height={120}>
+                <LineChart data={trendData} margin={{top:4,right:0,left:0,bottom:0}}>
+                  <XAxis dataKey="month" tick={{fontSize:10,fill:"#4b5563"}} axisLine={false} tickLine={false}/>
+                  <YAxis tick={{fontSize:10,fill:"#4b5563"}} axisLine={false} tickLine={false} tickFormatter={v=>`€${v}`} width={48}/>
+                  <Tooltip contentStyle={{background:"#1f2937",border:"1px solid #374151",borderRadius:8,fontSize:11}}
+                    labelStyle={{color:"#94a3b8"}} formatter={v=>[`€${v}`,""]}/>
+                  <Line type="monotone" dataKey="📊 Total" stroke="#f59e0b" strokeWidth={2.5}
+                    dot={{r:4,fill:"#f59e0b"}} activeDot={{r:6}}/>
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Per-category trends */}
             {activeCategories.map(cat=>(
               <div key={cat} className="card" style={{padding:"20px 24px",marginBottom:16}}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
@@ -613,8 +618,10 @@ export default function ExpenseTracker() {
                 </ResponsiveContainer>
               </div>
             ))}
+
+            {/* Stacked bar overview */}
             <div className="card" style={{padding:"20px 24px",marginTop:24}}>
-              <div style={{fontSize:14,marginBottom:16}}>All Categories Overview</div>
+              <div style={{fontSize:14,marginBottom:16}}>All Categories — Stacked</div>
               <ResponsiveContainer width="100%" height={220}>
                 <BarChart data={trendData} margin={{top:0,right:0,left:0,bottom:0}}>
                   <XAxis dataKey="month" tick={{fontSize:10,fill:"#4b5563"}} axisLine={false} tickLine={false}/>
@@ -630,10 +637,10 @@ export default function ExpenseTracker() {
           </div>
         )}
 
-        {/* TRANSACTIONS */}
+        {/* ── TRANSACTIONS ── */}
         {view==="list" && dbStatus==="ok" && transactions.length>0 && (
           <div>
-            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:20,flexWrap:"wrap"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,flexWrap:"wrap"}}>
               <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800}}>Transactions</div>
               <select value={filterMonth||""} onChange={e=>setFilterMonth(e.target.value||null)} style={{marginLeft:"auto"}}>
                 <option value="">All months</option>
@@ -643,39 +650,59 @@ export default function ExpenseTracker() {
                 <option value="">All categories</option>
                 {CATEGORIES.map(c=><option key={c} value={c}>{c}</option>)}
               </select>
-              {(filterMonth||filterCat)&&<button className="btn btn-ghost" onClick={()=>{setFilterMonth(null);setFilterCat(null);}}>Clear</button>}
+              <select value={filterSpender||""} onChange={e=>setFilterSpender(e.target.value||null)}>
+                <option value="">All spenders</option>
+                {SPENDERS.map(s=><option key={s} value={s}>{s}</option>)}
+              </select>
+              {(filterMonth||filterCat||filterSpender)&&
+                <button className="btn btn-ghost" onClick={()=>{setFilterMonth(null);setFilterCat(null);setFilterSpender(null);}}>Clear</button>}
             </div>
-            <div style={{fontSize:11,color:"#64748b",marginBottom:12}}>
+
+            <div style={{fontSize:11,color:"#64748b",marginBottom:16}}>
               {visibleTransactions.length} transactions · €{visibleTransactions.reduce((s,t)=>s+t.amount,0).toLocaleString("en",{maximumFractionDigits:0})} total
             </div>
+
             {visibleTransactions.map(t=>(
               <div key={t.id} className="tx-row">
-                <div style={{width:80,fontSize:11,color:"#4b5563",flexShrink:0}}>
+                <div style={{width:72,fontSize:11,color:"#4b5563",flexShrink:0}}>
                   {t.date?`${t.date.getDate()} ${MONTHS[t.date.getMonth()]}`:"—"}
                 </div>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.description}</div>
-                  <div style={{marginTop:3,display:"flex",gap:6,alignItems:"center"}}>
+                  <div style={{marginTop:3,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
                     <span className={`source-badge ${t.source==="Revolut"?"src-revolut":"src-wio"}`}>{t.source}</span>
+                    {/* Spender toggle */}
+                    {SPENDERS.map(s=>(
+                      <button key={s} className="spender-btn"
+                        style={{
+                          background: (t.spender||"Matteo")===s ? `${SPENDER_COLORS[s]}33` : "#1f2937",
+                          color: (t.spender||"Matteo")===s ? SPENDER_COLORS[s] : "#4b5563",
+                          border: `1px solid ${(t.spender||"Matteo")===s ? SPENDER_COLORS[s] : "#374151"}`
+                        }}
+                        onClick={()=>updateSpender(t.id, s)}>{s}</button>
+                    ))}
+                    {/* Category chip */}
                     <span className="cat-chip"
                       style={{background:`${CATEGORY_COLORS[t.category]}22`,color:CATEGORY_COLORS[t.category]}}
                       onClick={()=>setEditingTx(t)}>{t.category} ✎</span>
                   </div>
                 </div>
-                <div style={{fontSize:15,fontWeight:500,flexShrink:0}}>
+                <div style={{fontSize:15,fontWeight:500,flexShrink:0,marginRight:4}}>
                   €{t.amount.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2})}
                 </div>
+                <button className="delete-btn" title="Delete transaction" onClick={()=>setConfirmDelete(t)}>🗑</button>
               </div>
             ))}
           </div>
         )}
       </div>
 
+      {/* ── Category edit modal ── */}
       {editingTx && (
         <div className="modal-bg" onClick={()=>setEditingTx(null)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <div style={{fontSize:14,marginBottom:4}}>{editingTx.description}</div>
-            <div style={{fontSize:11,color:"#64748b",marginBottom:20}}>€{editingTx.amount} · Select category · saved to DB</div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:20}}>€{editingTx.amount} · Select category</div>
             <div style={{display:"flex",flexDirection:"column",gap:8}}>
               {CATEGORIES.map(cat=>(
                 <button key={cat} onClick={()=>updateCategory(editingTx.id,cat)}
@@ -689,6 +716,24 @@ export default function ExpenseTracker() {
               ))}
             </div>
             <button className="btn btn-ghost" style={{marginTop:16,width:"100%"}} onClick={()=>setEditingTx(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete confirm modal ── */}
+      {confirmDelete && (
+        <div className="modal-bg" onClick={()=>setConfirmDelete(null)}>
+          <div className="modal" style={{width:360}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:15,fontWeight:500,marginBottom:8}}>Delete transaction?</div>
+            <div style={{fontSize:13,color:"#94a3b8",marginBottom:4}}>{confirmDelete.description}</div>
+            <div style={{fontSize:13,color:"#94a3b8",marginBottom:20}}>
+              €{confirmDelete.amount.toLocaleString("en",{minimumFractionDigits:2})} · {confirmDelete.date?`${confirmDelete.date.getDate()} ${MONTHS[confirmDelete.date.getMonth()]} ${confirmDelete.date.getFullYear()}`:""}
+            </div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:20}}>This will permanently remove it from the database.</div>
+            <div style={{display:"flex",gap:10}}>
+              <button className="btn btn-danger" style={{flex:1,padding:"10px"}} onClick={()=>deleteTransaction(confirmDelete)}>Yes, delete</button>
+              <button className="btn btn-ghost" style={{flex:1,padding:"10px"}} onClick={()=>setConfirmDelete(null)}>Cancel</button>
+            </div>
           </div>
         </div>
       )}

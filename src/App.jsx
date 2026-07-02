@@ -280,7 +280,7 @@ function parseRevolutEN(text) {
     rows.push({ date, description, amount: finalAmount, currency: "EUR", source: "Revolut" });
   }
 
-  return rows.length ? rows : null;
+  return rows; // [] = detected but no spending; null never returned from here
 }
 
 function parseRevolutIT(text) {
@@ -310,48 +310,73 @@ function parseRevolutIT(text) {
     const finalAmount = currency === "EUR" ? Math.abs(amount) : Math.abs(toEUR(amount, currentCurrency));
     rows.push({ date, description, amount: +finalAmount.toFixed(2), currency: "EUR", source: "Revolut" });
   }
-  return rows.length ? rows : null;
+  return rows; // [] = detected but no spending
 }
 
 function parseWio(text) {
   const lines = text.split("\n");
   const header = (lines[0] || "").toLowerCase();
-  if (!header.includes("account name") && !header.includes("transaction type")) return null;
+  // Must have BOTH "account name" AND "transaction type" columns to be a Wio file
+  if (!header.includes("account name") || !header.includes("transaction type")) return null;
+
   const headerCols = splitCSVLine(lines[0]);
   const idx = {};
   headerCols.forEach((h, i) => { idx[h.replace(/^"|"$/g,"").trim().toLowerCase()] = i; });
-  const dateIdx = idx["date"] ?? 7;
-  const descIdx = idx["description"] ?? 9;
-  const amtIdx  = idx["amount"] ?? 10;
-  const typeIdx = idx["transaction type"] ?? 6;
-  const currIdx = idx["account currency"] ?? 5;
-  const acctTypeIdx = idx["account type"] ?? 1;
+  const dateIdx     = idx["date"]             ?? 7;
+  const descIdx     = idx["description"]      ?? 9;
+  const amtIdx      = idx["amount"]           ?? 10;
+  const typeIdx     = idx["transaction type"] ?? 6;
+  const currIdx     = idx["account currency"] ?? 5;
+  const acctTypeIdx = idx["account type"]     ?? 1;
+
   const rows = [];
   for (let i = 1; i < lines.length; i++) {
     const cols = splitCSVLine(lines[i]);
     if (cols.length < 5) continue;
+
+    // Skip Fixed Saving Space sub-accounts entirely
     const acctType = (cols[acctTypeIdx] || "").replace(/^"|"$/g,"").trim().toLowerCase();
     if (acctType.includes("saving")) continue;
-    const txType = (cols[typeIdx] || "").replace(/^"|"$/g,"").trim().toLowerCase();
-    const description = (cols[descIdx] || "").replace(/^"|"$/g,"").trim();
-    const amountRaw = (cols[amtIdx] || "").replace(/^"|"$/g,"").trim();
-    const currency = (cols[currIdx] || "AED").replace(/^"|"$/g,"").trim();
-    const dateRaw = (cols[dateIdx] || "").replace(/^"|"$/g,"").trim();
+
+    const txType      = (cols[typeIdx]  || "").replace(/^"|"$/g,"").trim().toLowerCase();
+    const description = (cols[descIdx]  || "").replace(/^"|"$/g,"").trim();
+    const amountRaw   = (cols[amtIdx]   || "").replace(/^"|"$/g,"").trim();
+    const currency    = (cols[currIdx]  || "AED").replace(/^"|"$/g,"").trim();
+    const dateRaw     = (cols[dateIdx]  || "").replace(/^"|"$/g,"").trim();
+
     const date = parseStdDate(dateRaw);
     if (!date) continue;
+
     const amount = parseFloat(amountRaw);
-    if (isNaN(amount) || amount > 0) continue;
-    if (txType === "transfers") {
-      const descL = description.toLowerCase();
-      if (descL.includes("salary") || descL.includes("etisalat grp")) continue;
-      if (descL.includes("fixed saving") || descL.includes("saving space")) continue;
-    }
-    rows.push({ date, description, amount: +toEUR(Math.abs(amount), currency).toFixed(2), currency: "EUR", source: "Wio" });
+    if (isNaN(amount)) continue;
+
+    // Skip all credits and zero amounts
+    if (amount >= 0) continue;
+
+    // Only Card transactions are unambiguous retail spending.
+    // Transfers covers savings, gifts, corporate payments, SWIFT — all excluded.
+    // Interest and Cashback are always income.
+    if (txType !== "card") continue;
+
+    rows.push({
+      date,
+      description,
+      amount: +toEUR(Math.abs(amount), currency).toFixed(2),
+      currency: "EUR",
+      source: "Wio"
+    });
   }
-  return rows.length ? rows : null;
+
+  // Return empty array (not null) when format was detected but no card spending found.
+  // Lets the ingest layer show "no spendable transactions" instead of a parse error.
+  return rows;
 }
 
-function parseCSV(text) { return parseRevolutIT(text) || parseRevolutEN(text) || parseWio(text); }
+// Returns: null = format not recognised | [] = recognised but no spending rows | [...] = rows parsed
+function parseCSV(text) {
+  const result = parseRevolutIT(text) ?? parseRevolutEN(text) ?? parseWio(text);
+  return result;
+}
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function ExpenseTracker() {

@@ -160,7 +160,129 @@ function parseEuropeanAmount(raw) {
   return { amount: null, currency: "EUR" };
 }
 
+// ─── Spender detection from filename ─────────────────────────────────────────
+// Files prefixed with "HLN-" are Helena's; everything else defaults to Matteo
+function spenderFromFilename(fileName) {
+  return (fileName || "").toUpperCase().startsWith("HLN-") ? "Helena" : "Matteo";
+}
+
 // ─── Parsers ──────────────────────────────────────────────────────────────────
+
+// English Revolut consolidated statement (Helena / Revolut Singapore)
+// Section headers: "Personal Account (AED)" etc.
+// Transaction table header: Date,Description,Category,"Money in/out",Balance,...
+// Date format: "3 Jan 2026"
+// Amount format: "-449.72 AED (-S$157.62)"  →  extract the leading native amount
+// We convert the native currency amount to EUR (ignore the SGD parenthetical)
+const EN_MONTHS = { "jan":0,"feb":1,"mar":2,"apr":3,"may":4,"jun":5,"jul":6,"aug":7,"sep":8,"oct":9,"nov":10,"dec":11 };
+
+function parseEnglishDate(raw) {
+  if (!raw) return null;
+  const clean = raw.replace(/^"|"$/g,"").trim();
+  // "3 Jan 2026" or "30 Jan 2026"
+  const m = clean.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  if (!m) return null;
+  const month = EN_MONTHS[m[2].toLowerCase()];
+  if (month === undefined) return null;
+  return new Date(+m[3], month, +m[1]);
+}
+
+// Parse amounts like:
+//   "-449.72 AED (-S$157.62)"   → { amount: -449.72, currency: "AED" }
+//   "24.75 AED (S$8.63)"        → { amount: 24.75,   currency: "AED" }
+//   "-20,000.00 AED (-S$...)"   → { amount: -20000,  currency: "AED" }
+//   "-S$7,006.78"               → skip (SGD base, already handled via AED row)
+function parseRevolutENAmount(raw) {
+  if (!raw) return { amount: null, currency: null };
+  const clean = raw.replace(/^"|"$/g,"").trim();
+
+  // Pattern: optional sign, number (with commas), space, CURRENCY CODE
+  // e.g. "-449.72 AED" or "24.75 AED" or "-20,000.00 AED"
+  const m = clean.match(/^([+-]?[\d,]+\.?\d*)\s+([A-Z]{3})/);
+  if (m) {
+    const amount = parseFloat(m[1].replace(/,/g,""));
+    const currency = m[2];
+    return { amount: isNaN(amount) ? null : amount, currency };
+  }
+
+  // Fallback: plain number with no currency (shouldn't happen in EN Revolut)
+  const plain = clean.match(/^([+-]?[\d,]+\.?\d*)$/);
+  if (plain) {
+    const amount = parseFloat(plain[1].replace(/,/g,""));
+    return { amount: isNaN(amount) ? null : amount, currency: null };
+  }
+
+  return { amount: null, currency: null };
+}
+
+function parseRevolutEN(text) {
+  const lines = text.split("\n");
+  // English consolidated from Revolut Singapore: has "Personal Account (XYZ)" sections
+  // and "Transaction statement" + "Date,Description,Category,"Money in/out"" header
+  if (!text.includes("Personal Account (") && !text.includes("Transaction statement")) return null;
+  // Must NOT be Italian (avoid misdetection)
+  if (text.includes("Estratti conto") || text.includes("Conto personale")) return null;
+
+  const rows = [];
+  let currentCurrency = null;
+  let inTransactionTable = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const cols = splitCSVLine(lines[i]);
+    const first = (cols[0] || "").replace(/^"|"$/g,"").trim();
+
+    // Detect currency section: "Personal Account (AED)"
+    const currMatch = first.match(/^Personal Account \(([A-Z]+)\)$/);
+    if (currMatch) {
+      currentCurrency = currMatch[1];
+      inTransactionTable = false;
+      continue;
+    }
+
+    // Detect transaction table header: Date, Description, Category, "Money in/out"
+    if (first === "Date" && cols.length >= 4 &&
+        (cols[3] || "").replace(/^"|"$/g,"").trim() === "Money in/out") {
+      inTransactionTable = true;
+      continue;
+    }
+
+    // End of table
+    if (first === "Total" || first === "---------" || first === "") {
+      if (first !== "") inTransactionTable = false;
+      continue;
+    }
+
+    // Skip non-transaction sections (Flexible Cash Funds etc.)
+    if (first === "Transaction statement (only returns)") { inTransactionTable = false; continue; }
+
+    if (!inTransactionTable || !currentCurrency) continue;
+
+    const dateRaw = cols[0] || "";
+    const description = (cols[1] || "").replace(/^"|"$/g,"").trim();
+    const category   = (cols[2] || "").replace(/^"|"$/g,"").trim().toLowerCase();
+    const amountRaw  = (cols[3] || "").replace(/^"|"$/g,"").trim();
+
+    const date = parseEnglishDate(dateRaw);
+    if (!date || !description) continue;
+
+    // Skip FX exchanges and SWIFT transfers (not real spending)
+    if (category === "exchange") continue;
+    if (description.toLowerCase().includes("exchanged to")) continue;
+    if (description.toLowerCase().includes("swift transfer")) continue;
+
+    const { amount, currency } = parseRevolutENAmount(amountRaw);
+    if (amount === null) continue;
+    if (amount >= 0) continue; // skip credits/refunds
+
+    const effectiveCurrency = currency || currentCurrency;
+    const finalAmount = +toEUR(Math.abs(amount), effectiveCurrency).toFixed(2);
+
+    rows.push({ date, description, amount: finalAmount, currency: "EUR", source: "Revolut" });
+  }
+
+  return rows.length ? rows : null;
+}
+
 function parseRevolutIT(text) {
   const lines = text.split("\n");
   if (!text.includes("Estratti conto delle operazioni") && !text.includes("Riepilogo delle transazioni")) return null;
@@ -229,7 +351,7 @@ function parseWio(text) {
   return rows.length ? rows : null;
 }
 
-function parseCSV(text) { return parseRevolutIT(text) || parseWio(text); }
+function parseCSV(text) { return parseRevolutIT(text) || parseRevolutEN(text) || parseWio(text); }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function ExpenseTracker() {
@@ -270,21 +392,26 @@ export default function ExpenseTracker() {
     reader.onload = async (e) => {
       try {
         const rows = parseCSV(e.target.result);
-        if (!rows || rows.length === 0) {
+        if (!rows) {
           setImportMsg({ type:"error", text:"Could not parse file — check it's a Revolut or Wio CSV export." });
           setImporting(false); setTimeout(()=>setImportMsg(null), 6000); return;
         }
+        if (rows.length === 0) {
+          setImportMsg({ type:"warn", text:`"${fileName}" parsed successfully but contained no spendable transactions (only savings/transfers). Nothing saved.` });
+          setImporting(false); setTimeout(()=>setImportMsg(null), 6000); return;
+        }
+        const spender = spenderFromFilename(fileName);
         const newTxns = rows.map((r, i) => ({
           id: `${fileName}-${i}-${r.date?.toISOString()}-${r.amount}-${r.description?.slice(0,10)}`,
           date: r.date, description: r.description, amount: r.amount,
           currency: "EUR", category: autoCategory(r.description),
-          source: r.source, file_name: fileName, spender: "Matteo"
+          source: r.source, file_name: fileName, spender
         }));
         setImportMsg({ type:"info", text:`Saving ${newTxns.length} transactions…` });
         await upsertTransactions(newTxns);
         const [txns, files] = await Promise.all([loadTransactions(), loadImportedFiles()]);
         setTransactions(txns); setImportedFiles(files);
-        setImportMsg({ type:"ok", text:`✓ ${newTxns.length} transactions imported from "${fileName}"` });
+        setImportMsg({ type:"ok", text:`✓ ${newTxns.length} transactions imported from "${fileName}" → assigned to ${spender}` });
         setTimeout(()=>setImportMsg(null), 5000);
       } catch (err) {
         setImportMsg({ type:"error", text:`Import failed: ${err.message}` });

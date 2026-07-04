@@ -185,7 +185,9 @@ function parseEuropeanAmount(raw) {
 // ─── Spender detection from filename ─────────────────────────────────────────
 // Files prefixed with "HLN-" are Helena's; everything else defaults to Matteo
 function spenderFromFilename(fileName) {
-  return (fileName || "").toUpperCase().startsWith("HLN-") ? "Helena" : "Matteo";
+  // Match "HLN" anywhere in the filename (case-insensitive), surrounded by non-alpha chars
+  // Covers: "HLN-foo.csv", "Monthly_statement-hln-_2026.csv", "foo_HLN_bar.csv"
+  return /[^a-z]hln[^a-z]/i.test("-" + (fileName || "") + "-") ? "Helena" : "Matteo";
 }
 
 // ─── Parsers ──────────────────────────────────────────────────────────────────
@@ -398,13 +400,23 @@ function parseWio(text) {
     const amount = parseFloat(amountRaw);
     if (isNaN(amount)) continue;
 
-    // Skip all credits and zero amounts
+    // Skip all credits and zero amounts (salary, interest, cashback, savings returns)
     if (amount >= 0) continue;
 
-    // Only Card transactions are unambiguous retail spending.
-    // Transfers covers savings, gifts, corporate payments, SWIFT — all excluded.
-    // Interest and Cashback are always income.
-    if (txType !== "card") continue;
+    // Skip income/saving types unconditionally
+    if (txType === "interest" || txType === "cashback" || txType === "salary credit") continue;
+
+    // For transfers: skip internal savings movements, keep external payments
+    if (txType === "transfers") {
+      const descL = description.toLowerCase();
+      // Skip savings space round-trips
+      if (descL.includes("fixed saving") || descL.includes("saving space")) continue;
+      // Skip salary/Revolut top-up inflows already caught by amount>=0, but belt-and-braces
+      if (descL.includes("salary") || descL.includes("etisalat grp")) continue;
+      // Skip incoming transfers from own accounts (Revolut → Wio deposits)
+      if (descL.includes("from helena") || descL.includes("from matteo")) continue;
+      // Anything else with a negative amount is a real external payment — keep it
+    }
 
     rows.push({
       date,

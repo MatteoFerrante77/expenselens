@@ -62,6 +62,28 @@ async function deleteTransactionInDB(id) {
     method: "DELETE", prefer: "return=minimal"
   });
 }
+async function deleteTransactionsBatchInDB(ids) {
+  if (!ids.length) return;
+  // Supabase REST supports in() filter for bulk deletes
+  const inList = ids.map(id => `"${id}"`).join(",");
+  await sbFetch(`transactions?id=in.(${encodeURIComponent(inList)})`, {
+    method: "DELETE", prefer: "return=minimal"
+  });
+}
+async function updateCategoryBatchInDB(ids, category) {
+  if (!ids.length) return;
+  const inList = ids.map(id => `"${id}"`).join(",");
+  await sbFetch(`transactions?id=in.(${encodeURIComponent(inList)})`, {
+    method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ category })
+  });
+}
+async function updateSpenderBatchInDB(ids, spender) {
+  if (!ids.length) return;
+  const inList = ids.map(id => `"${id}"`).join(",");
+  await sbFetch(`transactions?id=in.(${encodeURIComponent(inList)})`, {
+    method: "PATCH", prefer: "return=minimal", body: JSON.stringify({ spender })
+  });
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -108,7 +130,7 @@ function autoCategory(description) {
 }
 
 // ─── FX ───────────────────────────────────────────────────────────────────────
-const FX = { EUR:1, AED:0.257, USD:0.92, GBP:1.17, CHF:1.04, SGD:0.68, AUD:0.60 };
+const FX = { EUR:1, AED:0.257, USD:0.92, GBP:1.17, CHF:1.04, SGD:0.68, AUD:0.60, HKD:0.118, JPY:0.006, CNY:0.127, THB:0.026 };
 function toEUR(amount, currency) { return amount * (FX[currency] || 1); }
 
 // ─── CSV helpers ──────────────────────────────────────────────────────────────
@@ -196,16 +218,34 @@ function parseRevolutENAmount(raw) {
   if (!raw) return { amount: null, currency: null };
   const clean = raw.replace(/^"|"$/g,"").trim();
 
-  // Pattern: optional sign, number (with commas), space, CURRENCY CODE
-  // e.g. "-449.72 AED" or "24.75 AED" or "-20,000.00 AED"
-  const m = clean.match(/^([+-]?[\d,]+\.?\d*)\s+([A-Z]{3})/);
-  if (m) {
-    const amount = parseFloat(m[1].replace(/,/g,""));
-    const currency = m[2];
-    return { amount: isNaN(amount) ? null : amount, currency };
+  // Pattern 1: ISO code after number — "-449.72 AED (-S$169.75)" or "-70.00 AED (-S$24.25)"
+  // Extract the FIRST native-currency amount before any parenthetical
+  const isoMatch = clean.match(/^([+-]?[\d,]+\.?\d*)\s+([A-Z]{3})/);
+  if (isoMatch) {
+    const amount = parseFloat(isoMatch[1].replace(/,/g,""));
+    return { amount: isNaN(amount) ? null : amount, currency: isoMatch[2] };
   }
 
-  // Fallback: plain number with no currency (shouldn't happen in EN Revolut)
+  // Pattern 2: Symbol-prefix currencies — "-S$779.90", "$3,941.40 (S$4,999.02)", "AU$0.00", "£0.00"
+  // Map currency symbol prefixes to ISO codes
+  const SYMBOL_MAP = [
+    [/^([+-]?)S\$([\d,]+\.?\d*)/, "SGD"],   // S$  = SGD
+    [/^([+-]?)HK\$([\d,]+\.?\d*)/, "HKD"],  // HK$ = HKD
+    [/^([+-]?)AU\$([\d,]+\.?\d*)/, "AUD"],  // AU$ = AUD
+    [/^([+-]?)\$([\d,]+\.?\d*)/, "USD"],    // $   = USD
+    [/^([+-]?)€([\d,]+\.?\d*)/, "EUR"],      // €   = EUR
+    [/^([+-]?)£([\d,]+\.?\d*)/, "GBP"],      // £   = GBP
+  ];
+  for (const [re, iso] of SYMBOL_MAP) {
+    const m = clean.match(re);
+    if (m) {
+      const sign = m[1] === "-" ? -1 : 1;
+      const amount = sign * parseFloat(m[2].replace(/,/g,""));
+      return { amount: isNaN(amount) ? null : amount, currency: iso };
+    }
+  }
+
+  // Pattern 3: plain number
   const plain = clean.match(/^([+-]?[\d,]+\.?\d*)$/);
   if (plain) {
     const amount = parseFloat(plain[1].replace(/,/g,""));
@@ -265,10 +305,18 @@ function parseRevolutEN(text) {
     const date = parseEnglishDate(dateRaw);
     if (!date || !description) continue;
 
-    // Skip FX exchanges and SWIFT transfers (not real spending)
+    // Skip FX exchanges, SWIFT, top-ups, internal transfers and investment moves
     if (category === "exchange") continue;
-    if (description.toLowerCase().includes("exchanged to")) continue;
-    if (description.toLowerCase().includes("swift transfer")) continue;
+    if (category === "top up") continue;
+    const descL = description.toLowerCase();
+    if (descL.includes("exchanged to")) continue;
+    if (descL.includes("swift transfer")) continue;
+    if (descL.includes("transfer to ")) continue;       // "Transfer to MATTEO FERRANTE"
+    if (descL.includes("payment from ")) continue;      // "Payment from FLORES SANCHEZ HELENA"
+    if (descL.includes("flexible account")) continue;   // investment fund moves
+    if (descL.includes("to usd") || descL.includes("to sgd") || descL.includes("to eur") ||
+        descL.includes("to aed") || descL.includes("to hkd") || descL.includes("to aud") ||
+        descL.includes("to gbp")) continue;             // "To SGD" cashback-like credits
 
     const { amount, currency } = parseRevolutENAmount(amountRaw);
     if (amount === null) continue;
@@ -387,8 +435,11 @@ export default function ExpenseTracker() {
   const [importing, setImporting] = useState(false);
   const [importMsg, setImportMsg] = useState(null);
   const [view, setView] = useState("dashboard");
-  const [editingTx, setEditingTx] = useState(null);  // for category modal
-  const [confirmDelete, setConfirmDelete] = useState(null); // tx to confirm delete
+  const [editingTx, setEditingTx] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [batchModal, setBatchModal] = useState(null); // "delete" | "category" | "spender"
+  const [batchWorking, setBatchWorking] = useState(false);
   const [filterMonth, setFilterMonth] = useState(null); // null = all months
   const [filterCat, setFilterCat] = useState(null);
   const [filterSpender, setFilterSpender] = useState(null);
@@ -467,6 +518,54 @@ export default function ExpenseTracker() {
     setTransactions(prev => prev.filter(t => t.id !== tx.id));
     setConfirmDelete(null);
     try { await deleteTransactionInDB(tx.id); } catch(e) { console.error(e); }
+  };
+
+  // ── Selection helpers
+  const toggleSelect = (id) => setSelectedIds(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+  const toggleSelectAll = () => {
+    if (selectedIds.size === visibleTransactions.length) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(visibleTransactions.map(t => t.id)));
+    }
+  };
+  const clearSelection = () => setSelectedIds(new Set());
+
+  // ── Batch delete
+  const batchDelete = async () => {
+    const ids = [...selectedIds];
+    setBatchWorking(true);
+    setTransactions(prev => prev.filter(t => !selectedIds.has(t.id)));
+    setSelectedIds(new Set());
+    setBatchModal(null);
+    try { await deleteTransactionsBatchInDB(ids); } catch(e) { console.error(e); }
+    setBatchWorking(false);
+  };
+
+  // ── Batch category update
+  const batchSetCategory = async (cat) => {
+    const ids = [...selectedIds];
+    setBatchWorking(true);
+    setTransactions(prev => prev.map(t => selectedIds.has(t.id) ? {...t, category: cat} : t));
+    setSelectedIds(new Set());
+    setBatchModal(null);
+    try { await updateCategoryBatchInDB(ids, cat); } catch(e) { console.error(e); }
+    setBatchWorking(false);
+  };
+
+  // ── Batch spender update
+  const batchSetSpender = async (spender) => {
+    const ids = [...selectedIds];
+    setBatchWorking(true);
+    setTransactions(prev => prev.map(t => selectedIds.has(t.id) ? {...t, spender} : t));
+    setSelectedIds(new Set());
+    setBatchModal(null);
+    try { await updateSpenderBatchInDB(ids, spender); } catch(e) { console.error(e); }
+    setBatchWorking(false);
   };
 
   // ── Derived data
@@ -584,6 +683,10 @@ export default function ExpenseTracker() {
         .tx-row:hover .delete-btn{opacity:1}
         .filter-chip{padding:4px 12px;border-radius:20px;border:1px solid #374151;background:none;color:#64748b;font-family:inherit;font-size:11px;cursor:pointer;transition:all 0.15s}
         .filter-chip.active{border-color:#f59e0b;color:#f59e0b;background:rgba(245,158,11,0.08)}
+        .cb{width:16px;height:16px;border-radius:4px;border:1.5px solid #374151;background:#1f2937;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all 0.15s}
+        .cb.checked{background:#f59e0b;border-color:#f59e0b}
+        .batch-bar{position:sticky;top:0;z-index:10;background:#1a1205;border:1px solid #f59e0b44;border-radius:10px;padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:10px;font-size:12px}
+        .tx-row.selected{background:#1c1508;border-radius:8px;padding-left:8px;padding-right:8px}
       `}</style>
 
       {/* Header */}
@@ -792,48 +895,73 @@ export default function ExpenseTracker() {
         {/* ── TRANSACTIONS ── */}
         {view==="list" && dbStatus==="ok" && transactions.length>0 && (
           <div>
-            <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:16,flexWrap:"wrap"}}>
+            {/* Filters row */}
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14,flexWrap:"wrap"}}>
               <div style={{fontFamily:"'Syne',sans-serif",fontSize:20,fontWeight:800}}>Transactions</div>
-              <select value={filterMonth||""} onChange={e=>setFilterMonth(e.target.value||null)} style={{marginLeft:"auto"}}>
+              <select value={filterMonth||""} onChange={e=>{setFilterMonth(e.target.value||null);clearSelection();}} style={{marginLeft:"auto"}}>
                 <option value="">All months</option>
                 {allMonths.map(mk=>{const[y,m]=mk.split("-");return<option key={mk} value={mk}>{MONTHS[+m]} {y}</option>;})}
               </select>
-              <select value={filterCat||""} onChange={e=>setFilterCat(e.target.value||null)}>
+              <select value={filterCat||""} onChange={e=>{setFilterCat(e.target.value||null);clearSelection();}}>
                 <option value="">All categories</option>
                 {CATEGORIES.map(c=><option key={c} value={c}>{c}</option>)}
               </select>
-              <select value={filterSpender||""} onChange={e=>setFilterSpender(e.target.value||null)}>
+              <select value={filterSpender||""} onChange={e=>{setFilterSpender(e.target.value||null);clearSelection();}}>
                 <option value="">All spenders</option>
                 {SPENDERS.map(s=><option key={s} value={s}>{s}</option>)}
               </select>
               {(filterMonth||filterCat||filterSpender)&&
-                <button className="btn btn-ghost" onClick={()=>{setFilterMonth(null);setFilterCat(null);setFilterSpender(null);}}>Clear</button>}
+                <button className="btn btn-ghost" onClick={()=>{setFilterMonth(null);setFilterCat(null);setFilterSpender(null);clearSelection();}}>Clear</button>}
             </div>
 
-            <div style={{fontSize:11,color:"#64748b",marginBottom:16}}>
-              {visibleTransactions.length} transactions · €{visibleTransactions.reduce((s,t)=>s+t.amount,0).toLocaleString("en",{maximumFractionDigits:0})} total
+            {/* Summary + select-all row */}
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+              <div
+                className={`cb ${selectedIds.size===visibleTransactions.length && visibleTransactions.length>0?"checked":""}`}
+                onClick={toggleSelectAll}
+                title="Select all visible"
+              >{selectedIds.size===visibleTransactions.length && visibleTransactions.length>0 ? "✓" : ""}</div>
+              <span style={{fontSize:11,color:"#64748b"}}>
+                {visibleTransactions.length} transactions · €{visibleTransactions.reduce((s,t)=>s+t.amount,0).toLocaleString("en",{maximumFractionDigits:0})} total
+                {selectedIds.size>0 && <span style={{color:"#f59e0b",marginLeft:8}}>· {selectedIds.size} selected</span>}
+              </span>
             </div>
 
+            {/* Batch action bar — appears when items selected */}
+            {selectedIds.size>0 && (
+              <div className="batch-bar">
+                <span style={{color:"#f59e0b",fontWeight:500}}>{selectedIds.size} selected</span>
+                <span style={{color:"#4b5563",margin:"0 4px"}}>·</span>
+                <button className="btn btn-ghost" style={{fontSize:11}} onClick={()=>setBatchModal("category")}>✎ Set Category</button>
+                <button className="btn btn-ghost" style={{fontSize:11}} onClick={()=>setBatchModal("spender")}>👤 Set Spender</button>
+                <button className="btn btn-danger" style={{fontSize:11,marginLeft:"auto"}} onClick={()=>setBatchModal("delete")}>🗑 Delete {selectedIds.size}</button>
+                <button className="btn btn-ghost" style={{fontSize:11}} onClick={clearSelection}>✕ Cancel</button>
+              </div>
+            )}
+
+            {/* Transaction rows */}
             {visibleTransactions.map(t=>(
-              <div key={t.id} className="tx-row">
-                <div style={{width:72,fontSize:11,color:"#4b5563",flexShrink:0}}>
+              <div key={t.id} className={`tx-row${selectedIds.has(t.id)?" selected":""}`}>
+                {/* Checkbox */}
+                <div className={`cb ${selectedIds.has(t.id)?"checked":""}`} onClick={()=>toggleSelect(t.id)}>
+                  {selectedIds.has(t.id)&&<span style={{fontSize:10,color:"#000",fontWeight:700}}>✓</span>}
+                </div>
+                <div style={{width:68,fontSize:11,color:"#4b5563",flexShrink:0}}>
                   {t.date?`${t.date.getDate()} ${MONTHS[t.date.getMonth()]}`:"—"}
                 </div>
                 <div style={{flex:1,minWidth:0}}>
                   <div style={{fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{t.description}</div>
                   <div style={{marginTop:3,display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
                     <span className={`source-badge ${t.source==="Revolut"?"src-revolut":"src-wio"}`}>{t.source}</span>
-                    {/* Spender toggle */}
                     {SPENDERS.map(s=>(
                       <button key={s} className="spender-btn"
                         style={{
-                          background: (t.spender||"Matteo")===s ? `${SPENDER_COLORS[s]}33` : "#1f2937",
-                          color: (t.spender||"Matteo")===s ? SPENDER_COLORS[s] : "#4b5563",
-                          border: `1px solid ${(t.spender||"Matteo")===s ? SPENDER_COLORS[s] : "#374151"}`
+                          background:(t.spender||"Matteo")===s?`${SPENDER_COLORS[s]}33`:"#1f2937",
+                          color:(t.spender||"Matteo")===s?SPENDER_COLORS[s]:"#4b5563",
+                          border:`1px solid ${(t.spender||"Matteo")===s?SPENDER_COLORS[s]:"#374151"}`
                         }}
-                        onClick={()=>updateSpender(t.id, s)}>{s}</button>
+                        onClick={()=>updateSpender(t.id,s)}>{s}</button>
                     ))}
-                    {/* Category chip */}
                     <span className="cat-chip"
                       style={{background:`${CATEGORY_COLORS[t.category]}22`,color:CATEGORY_COLORS[t.category]}}
                       onClick={()=>setEditingTx(t)}>{t.category} ✎</span>
@@ -842,7 +970,7 @@ export default function ExpenseTracker() {
                 <div style={{fontSize:15,fontWeight:500,flexShrink:0,marginRight:4}}>
                   €{t.amount.toLocaleString("en",{minimumFractionDigits:2,maximumFractionDigits:2})}
                 </div>
-                <button className="delete-btn" title="Delete transaction" onClick={()=>setConfirmDelete(t)}>🗑</button>
+                <button className="delete-btn" title="Delete" onClick={()=>setConfirmDelete(t)}>🗑</button>
               </div>
             ))}
           </div>
@@ -872,7 +1000,7 @@ export default function ExpenseTracker() {
         </div>
       )}
 
-      {/* ── Delete confirm modal ── */}
+      {/* ── Single delete confirm modal ── */}
       {confirmDelete && (
         <div className="modal-bg" onClick={()=>setConfirmDelete(null)}>
           <div className="modal" style={{width:360}} onClick={e=>e.stopPropagation()}>
@@ -886,6 +1014,67 @@ export default function ExpenseTracker() {
               <button className="btn btn-danger" style={{flex:1,padding:"10px"}} onClick={()=>deleteTransaction(confirmDelete)}>Yes, delete</button>
               <button className="btn btn-ghost" style={{flex:1,padding:"10px"}} onClick={()=>setConfirmDelete(null)}>Cancel</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch delete confirm modal ── */}
+      {batchModal==="delete" && (
+        <div className="modal-bg" onClick={()=>setBatchModal(null)}>
+          <div className="modal" style={{width:360}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:15,fontWeight:500,marginBottom:8}}>Delete {selectedIds.size} transactions?</div>
+            <div style={{fontSize:13,color:"#94a3b8",marginBottom:20}}>
+              This will permanently remove all {selectedIds.size} selected transactions from the database. This cannot be undone.
+            </div>
+            <div style={{display:"flex",gap:10}}>
+              <button className="btn btn-danger" style={{flex:1,padding:"10px"}} disabled={batchWorking} onClick={batchDelete}>
+                {batchWorking?"Deleting…":`Yes, delete ${selectedIds.size}`}
+              </button>
+              <button className="btn btn-ghost" style={{flex:1,padding:"10px"}} onClick={()=>setBatchModal(null)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch category modal ── */}
+      {batchModal==="category" && (
+        <div className="modal-bg" onClick={()=>setBatchModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:14,marginBottom:4}}>Set category for {selectedIds.size} transactions</div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:20}}>All selected rows will be updated in the database.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:8}}>
+              {CATEGORIES.map(cat=>(
+                <button key={cat} disabled={batchWorking} onClick={()=>batchSetCategory(cat)}
+                  style={{
+                    background:"#1f2937",border:"1px solid #374151",color:CATEGORY_COLORS[cat],
+                    borderRadius:8,padding:"10px 14px",cursor:"pointer",textAlign:"left",
+                    fontFamily:"inherit",fontSize:13,transition:"all 0.15s",opacity:batchWorking?0.5:1
+                  }}>{cat}</button>
+              ))}
+            </div>
+            <button className="btn btn-ghost" style={{marginTop:16,width:"100%"}} onClick={()=>setBatchModal(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Batch spender modal ── */}
+      {batchModal==="spender" && (
+        <div className="modal-bg" onClick={()=>setBatchModal(null)}>
+          <div className="modal" style={{width:320}} onClick={e=>e.stopPropagation()}>
+            <div style={{fontSize:14,marginBottom:4}}>Assign spender for {selectedIds.size} transactions</div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:20}}>All selected rows will be updated in the database.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {SPENDERS.map(s=>(
+                <button key={s} disabled={batchWorking} onClick={()=>batchSetSpender(s)}
+                  style={{
+                    background:`${SPENDER_COLORS[s]}22`,border:`1px solid ${SPENDER_COLORS[s]}`,
+                    color:SPENDER_COLORS[s],borderRadius:8,padding:"12px 14px",cursor:"pointer",
+                    textAlign:"left",fontFamily:"inherit",fontSize:14,fontWeight:500,
+                    transition:"all 0.15s",opacity:batchWorking?0.5:1
+                  }}>{s}</button>
+              ))}
+            </div>
+            <button className="btn btn-ghost" style={{marginTop:16,width:"100%"}} onClick={()=>setBatchModal(null)}>Cancel</button>
           </div>
         </div>
       )}
